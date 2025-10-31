@@ -385,6 +385,7 @@ type GyingPlugin struct {
 	users    sync.Map // 内存缓存：hash -> *User
 	scrapers sync.Map // cloudscraper实例缓存：hash -> *cloudscraper.Scraper
 	mu       sync.RWMutex
+	searchCache sync.Map // 插件级缓存：关键词->model.PluginSearchResult
 }
 
 // User 用户数据结构
@@ -489,41 +490,63 @@ func (p *GyingPlugin) Search(keyword string, ext map[string]interface{}) ([]mode
 // 2. 有自己的用户会话管理
 // 3. Service层已经有缓存，无需插件层再次缓存
 func (p *GyingPlugin) SearchWithResult(keyword string, ext map[string]interface{}) (model.PluginSearchResult, error) {
-	if DebugLog {
-		fmt.Printf("[Gying] ========== 开始搜索: %s ==========\n", keyword)
-	}
+    // 解析 ext["refresh"]
+    forceRefresh := false
+    if ext != nil {
+        if v, ok := ext["refresh"]; ok {
+            if b, ok := v.(bool); ok && b {
+                forceRefresh = true
+            }
+        }
+    }
 
-	// 1. 获取所有有效用户
-	users := p.getActiveUsers()
-	if DebugLog {
-		fmt.Printf("[Gying] 找到 %d 个有效用户\n", len(users))
-	}
-	
-	if len(users) == 0 {
-		if DebugLog {
-			fmt.Printf("[Gying] 没有有效用户，返回空结果\n")
-		}
-		return model.PluginSearchResult{Results: []model.SearchResult{}, IsFinal: true}, nil
-	}
+    if !forceRefresh {
+        if cacheItem, ok := p.searchCache.Load(keyword); ok {
+            cached := cacheItem.(model.PluginSearchResult)
+            if DebugLog {
+                fmt.Printf("[Gying] 命中插件缓存: %s\n", keyword)
+            }
+            return cached, nil
+        }
+    } else {
+        if DebugLog {
+            fmt.Printf("[Gying] 强制刷新，此次跳过插件缓存，关键词: %s\n", keyword)
+        }
+    }
 
-	// 2. 限制用户数量
-	if len(users) > MaxConcurrentUsers {
-		sort.Slice(users, func(i, j int) bool {
-			return users[i].LastAccessAt.After(users[j].LastAccessAt)
-		})
-		users = users[:MaxConcurrentUsers]
-	}
-
-	// 3. 并发执行搜索
-	results := p.executeSearchTasks(users, keyword)
-	if DebugLog {
-		fmt.Printf("[Gying] 搜索完成，获得 %d 条结果\n", len(results))
-	}
-
-	return model.PluginSearchResult{
-		Results: results,
-		IsFinal: true,
-	}, nil
+    // 原有真实抓取逻辑
+    if DebugLog {
+        fmt.Printf("[Gying] searchWithScraper REAL 执行: %s\n", keyword)
+    }
+    users := p.getActiveUsers()
+    if DebugLog {
+        fmt.Printf("[Gying] 找到 %d 个有效用户\n", len(users))
+    }
+    if len(users) == 0 {
+        if DebugLog {
+            fmt.Printf("[Gying] 没有有效用户，返回空结果\n")
+        }
+        return model.PluginSearchResult{Results: []model.SearchResult{}, IsFinal: true}, nil
+    }
+    if len(users) > MaxConcurrentUsers {
+        sort.Slice(users, func(i, j int) bool {
+            return users[i].LastAccessAt.After(users[j].LastAccessAt)
+        })
+        users = users[:MaxConcurrentUsers]
+    }
+    results := p.executeSearchTasks(users, keyword)
+    if DebugLog {
+        fmt.Printf("[Gying] 搜索完成，获得 %d 条结果\n", len(results))
+    }
+    realResult := model.PluginSearchResult{
+        Results: results,
+        IsFinal: true,
+    }
+    // 写入缓存
+    if len(results) > 0 {
+        p.searchCache.Store(keyword, realResult)
+    }
+    return realResult, nil
 }
 
 // ============ 用户管理 ============
@@ -573,7 +596,7 @@ func (p *GyingPlugin) loadAllUsers() {
 // initDefaultAccounts 初始化所有账户（异步执行，不阻塞启动）
 // 包括：1. DefaultAccounts（代码配置）  2. 从文件加载的用户（使用加密密码重新登录）
 func (p *GyingPlugin) initDefaultAccounts() {
-	fmt.Printf("[Gying] ========== 异步初始化所有账户 ==========\n")
+	// fmt.Printf("[Gying] ========== 异步初始化所有账户 ==========\n")
 	
 	// 步骤1：处理DefaultAccounts（代码中配置的默认账户）
 	for i, account := range DefaultAccounts {
@@ -614,7 +637,7 @@ func (p *GyingPlugin) initDefaultAccounts() {
 		}
 	}
 
-	fmt.Printf("[Gying] ========== 所有账户初始化完成 ==========\n")
+	// fmt.Printf("[Gying] ========== 所有账户初始化完成 ==========\n")
 }
 
 // initOrRestoreUser 初始化或恢复单个用户（登录并保存）
@@ -1539,7 +1562,7 @@ func (p *GyingPlugin) searchWithScraper(keyword string, scraper *cloudscraper.Sc
 	}
 
 	// 1. 使用cloudscraper请求搜索页面
-	searchURL := fmt.Sprintf("https://www.gying.net/s/1---1/%s", url.QueryEscape(keyword))
+	searchURL := fmt.Sprintf("https://www.gying.net/s/2-0--1/%s", url.QueryEscape(keyword))
 	
 	if DebugLog {
 		fmt.Printf("[Gying] 搜索URL: %s\n", searchURL)
@@ -1658,7 +1681,7 @@ func (p *GyingPlugin) searchWithScraper(keyword string, scraper *cloudscraper.Sc
 	}
 	
 	// 4. 并发请求详情接口
-	results, err := p.fetchAllDetails(&searchData, scraper)
+	results, err := p.fetchAllDetails(&searchData, scraper, keyword)
 	if err != nil {
 		if DebugLog {
 			fmt.Printf("[Gying] fetchAllDetails 失败: %v\n", err)
@@ -1676,10 +1699,10 @@ func (p *GyingPlugin) searchWithScraper(keyword string, scraper *cloudscraper.Sc
 }
 
 // fetchAllDetails 并发获取所有详情
-func (p *GyingPlugin) fetchAllDetails(searchData *SearchData, scraper *cloudscraper.Scraper) ([]model.SearchResult, error) {
+func (p *GyingPlugin) fetchAllDetails(searchData *SearchData, scraper *cloudscraper.Scraper, keyword string) ([]model.SearchResult, error) {
 	if DebugLog {
 		fmt.Printf("[Gying] >>> fetchAllDetails 开始\n")
-		fmt.Printf("[Gying] 需要获取 %d 个详情\n", len(searchData.L.I))
+		fmt.Printf("[Gying] 需要获取 %d 个详情，关键词: %s\n", len(searchData.L.I), keyword)
 	}
 
 	var results []model.SearchResult
@@ -1692,6 +1715,9 @@ func (p *GyingPlugin) fetchAllDetails(searchData *SearchData, scraper *cloudscra
 	successCount := 0
 	failCount := 0
 	has403 := false
+	
+	// 将关键词转为小写，用于不区分大小写的匹配
+	keywordLower := strings.ToLower(keyword)
 
 	for i := 0; i < len(searchData.L.I); i++ {
 		wg.Add(1)
@@ -1709,9 +1735,28 @@ func (p *GyingPlugin) fetchAllDetails(searchData *SearchData, scraper *cloudscra
 			}
 			mu.Unlock()
 
+			// 检查标题是否包含搜索关键词
+			if index >= len(searchData.L.Title) {
+				if DebugLog {
+					fmt.Printf("[Gying]   [%d/%d] ⏭️  跳过: 索引超出标题数组范围\n", 
+						index+1, len(searchData.L.I))
+				}
+				return
+			}
+			
+			title := searchData.L.Title[index]
+			titleLower := strings.ToLower(title)
+			if !strings.Contains(titleLower, keywordLower) {
+				if DebugLog {
+					fmt.Printf("[Gying]   [%d/%d] ⏭️  跳过: 标题不包含关键词 '%s' (标题: %s)\n", 
+						index+1, len(searchData.L.I), keyword, title)
+				}
+				return
+			}
+
 			if DebugLog {
-				fmt.Printf("[Gying]   [%d/%d] 获取详情: ID=%s, Type=%s\n", 
-					index+1, len(searchData.L.I), searchData.L.I[index], searchData.L.D[index])
+				fmt.Printf("[Gying]   [%d/%d] 获取详情: ID=%s, Type=%s, 标题=%s\n", 
+					index+1, len(searchData.L.I), searchData.L.I[index], searchData.L.D[index], title)
 			}
 
 			detail, err := p.fetchDetail(searchData.L.I[index], searchData.L.D[index], scraper)
@@ -1866,6 +1911,14 @@ func (p *GyingPlugin) buildResult(detail *DetailData, searchData *SearchData, in
 	title := searchData.L.Title[index]
 	resourceType := searchData.L.D[index]
 	resourceID := searchData.L.I[index]
+	
+	// 获取年份并拼接到标题后面
+	var year int
+	if index < len(searchData.L.Year) && searchData.L.Year[index] > 0 {
+		year = searchData.L.Year[index]
+		// 拼接年份到标题：遮天（2023）
+		title = fmt.Sprintf("%s（%d）", title, year)
+	}
 
 	// 构建描述
 	var contentParts []string
@@ -1882,10 +1935,10 @@ func (p *GyingPlugin) buildResult(detail *DetailData, searchData *SearchData, in
 	// 提取网盘链接
 	links := p.extractPanLinks(detail)
 
-	// 构建标签
+	// 构建标签（保留年份标签，提供额外的过滤维度）
 	var tags []string
-	if index < len(searchData.L.Year) && searchData.L.Year[index] > 0 {
-		tags = append(tags, fmt.Sprintf("%d", searchData.L.Year[index]))
+	if year > 0 {
+		tags = append(tags, fmt.Sprintf("%d", year))
 	}
 
 	return model.SearchResult{
